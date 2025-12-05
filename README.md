@@ -749,14 +749,15 @@ Escreve no registrador `PIO_COORDS_MOUSE` (offset `0x70`) com sincronização ga
 O arquivo main.c funciona como a camada de interface entre o usuário e as rotinas de baixo nível implementadas em Assembly, coordenando todo o fluxo de execução do sistema.
 
 **Includes e Dependências:**
-O programa utiliza bibliotecas padrão do C para operações de entrada/saída, manipulação de memória e tipos de dados de tamanho fixo. O arquivo header.h contém as estruturas de dados do formato BMP necessárias para o processamento de imagens.
+O programa agora é uma aplicação multithread que utiliza bibliotecas de baixo nível do Linux para interação com dispositivos:
+- **linux/input.h (<sys/input.h>):** Essencial para a leitura de eventos brutos do mouse (Evdev).
+- **termios.h:** Utilizado para configurar o terminal em modo não canônico, permitindo que as teclas sejam lidas imediatamente (sem necessidade de pressionar ENTER), crucial para o controle de zoom.
 
 **Declarações Externas:**
-São declarados protótipos de todas as funções implementadas em Assembly (marcadas com extern), permitindo que o código C as invoque:
-  - **Gerenciamento da API:** iniciarAPI() e encerrarAPI() - Inicializam e finalizam a comunicação com a FPGA;
-  - **Operações de Processamento:** NHI(), replicacao(), decimacao(), media_blocos() - Algoritmos de redimensionamento que recebem o nível de zoom como parâmetro;
-  - **Monitoramento:** Flag_Done() - Verifica se o hardware está pronto ou ocupado;
-  - **Transferência de Dados:** write_pixel() - Envia um pixel individual para a memória de vídeo.
+Para suportar a interação em tempo real e o controle da visualização, novos protótipos de funções Assembly (API) foram adicionados:
+  - **extern void reset_system()**
+  - **extern int set_janela(int x, int y, int w, int h)**
+  - **extern void write_mouse_coords(int x, int y)** 
 
 **Fluxo Principal:**
 O programa segue um ciclo de vida bem definido:
@@ -768,52 +769,69 @@ Caso a inicialização falhe, o programa exibe uma mensagem de erro e encerra im
 
 ---
 
-### Função: `enviar_imagem_bmp(filename)`
+### Uso do Mouse (Evdev) para Seleção de Janela
 
-**Propósito:** Carregar uma imagem em formato BMP do disco e transferi-la pixel por pixel para a memória de vídeo (VRAM) da FPGA.
+A função selecionar_janela_mouse é a principal responsável por integrar a entrada do mouse ao sistema de processamento de imagem, permitindo ao usuário definir interativamente a Região de Interesse (ROI) na imagem base.
 
-**Funcionalidades:**
-A função realiza o processamento completo de arquivos BMP, incluindo:
+- Dispositivo e Modo de Operação: O programa abre o dispositivo do mouse (/dev/input/event0) em modo não bloqueante (O_NONBLOCK). Isso permite que o programa continue executando enquanto aguarda o movimento ou clique do mouse.
 
-  - **Leitura e Validação:** Abre o arquivo, lê os cabeçalhos BMP e verifica se o formato é válido (assinatura 'BM');
-  - **Suporte Multi-formato:** Aceita imagens em 8 bits (grayscale) ou 24 bits (RGB colorido);
-  - **Conversão Automática:** Para imagens coloridas (24 bits), converte RGB para escala de cinza usando a fórmula de média simples: (R + G + B) / 3;
-  - **Correção de Orientação:** Compensa a inversão vertical característica do formato BMP, que armazena pixels de baixo para cima
-  - **Tratamento de Padding:** Lida corretamente com o alinhamento de 4 bytes usado em linhas BMP
-  - **Feedback Visual:** Exibe informações da imagem (dimensões, bits por pixel) e progresso em tempo real durante o envio
+- Rastreamento do Cursor: O programa mantém um cursor virtual global (g_cursor_x, g_cursor_y), que é atualizado a cada evento de movimento relativo (EV_REL, REL_X, REL_Y) lido do mouse. As coordenadas são limitadas aos limites da imagem base (LARGURA_IMG x ALTURA_IMG).
 
-**Dimensões Esperadas:**
-O sistema foi projetado para imagens de 160×120 pixels (19.200 pixels totais), emitindo um aviso caso a imagem tenha dimensões diferentes.
+  - As coordenadas virtuais do cursor são enviadas ao hardware através da função write_mouse_coords(x, y), presumivelmente para um cursor visual na tela de saída.
 
-**Processo de Transferência:**
-Cada pixel é enviado individualmente para a VRAM através da função write_pixel, que recebe o endereço linear do pixel e seu valor em escala de cinza. A barra de progresso é atualizada a cada 500 pixels processados.
+- Seleção de Pontos: O usuário define a janela clicando duas vezes com o botão esquerdo (EV_KEY, BTN_LEFT, value == 1). O primeiro clique define o Ponto A, e o segundo define o Ponto B.
 
-**Retorno:**
-  - 0: Imagem enviada com sucesso
-  - -1: Erro (arquivo não encontrado, formato inválido, falha de memória, etc.)
+- Cálculo e Validação da Janela: Após a seleção dos dois pontos, a função calcula o canto superior esquerdo (x_inicio, y_inicio) e as dimensões (largura, altura) da ROI.
+
+  - Novas Regras de Validação: Foi implementado um loop do-while para forçar a re-seleção se a janela não atender aos critérios de dimensão:
+
+    - Mínimo: Ambas as dimensões devem ser estritamente maiores que 50 pixels (MIN_DIM).
+
+    - Máximo: Nenhuma dimensão pode ser maior que 180 pixels (MAX_DIM).
+
+- Comunicação com o Hardware: A janela validada é enviada ao FPGA pela função set_janela(x_inicio, y_inicio, largura, altura).
 
 ---
 
-### Menu Interativo
+### Uso do Teclado (Modo Raw) para Controle de Zoom
 
-O programa oferece um menu em console que permite testar todas as funcionalidades de processamento de imagens de forma interativa. Ao executar, o usuário tem acesso às seguintes opções:
+A função modo_zoom_interativo gerencia a alternância entre os níveis de zoom usando o teclado.
 
-**Operações de Processamento (opções 1-4):**
+- **Configuração de Terminal:** O programa utiliza as funções enable_raw_mode() e disable_raw_mode() (implementadas usando termios) para colocar o terminal em modo raw.
 
-  - **Vizinho Próximo (NHI):** Aplica interpolação por vizinho mais próximo
-  - **Replicação:** Redimensiona a imagem usando técnica de replicação de pixels
-  - **Decimação:** Reduz a resolução da imagem por decimação
-  - **Média de Blocos:** Redimensiona calculando a média de blocos de pixels
+   - O modo raw permite a leitura imediata de cada caractere pressionado (sem a necessidade de Enter) e desabilita o echo (não exibe o caractere digitado).
 
-Para cada uma dessas operações, o sistema solicita o nível de zoom desejado (1x, 2x, 4x ou 8x) e executa o processamento, informando se foi concluído com sucesso ou se ocorreu algum erro (como timeout).
+**Controles de Teclado:**
 
-**Outras Funcionalidades:**
+- Zoom In: Incrementa o nível de zoom atual (g_nivel_zoom_atual). O fator de zoom é dado por 2nıˊvel.
 
-  - **Verificar Status:** Consulta se o hardware está pronto (PRONTO) ou ocupado (OCUPADO) processando
-  - **Enviar imagem BMP:** Carrega uma imagem em formato BMP para a memória do sistema
-  - **Sair:** Encerra o programa e libera os recursos da API
+   - A aplicação alterna entre o Vizinho Próximo (NHI) e a Replicação de acordo com a escolha prévia do usuário.
 
-O menu é executado em loop até que o usuário escolha a opção de saída, inicializando a API no início e finalizando-a adequadamente ao encerrar.
+   - Validação de Limite de Zoom In: Uma nova regra de limite foi implementada para evitar que janelas muito grandes sejam ampliadas:
+
+       - Para ir a 2x (nível 1), largura e altura devem ser menores que 180.
+
+       - Para ir a 4x (nível 2), largura e altura devem ser menores que 130.
+
+- Zoom Out: Decrementa o nível de zoom.
+
+  - Aplica Decimação ou Média de Blocos para reduzir de 2x para 1x.
+
+  - Se estiver em 4x e reduzir, ele volta para 2x usando a Replicação para garantir um reposicionamento correto do ponto de vista.
+
+**Sair (q, Q, ou ESC):** Encerra o modo interativo.
+
+**Estado Global:** A variável g_nivel_zoom_atual rastreia o nível de zoom aplicado (0=1x, 1=2x, 2=4x) para controlar as operações de Zoom In e Zoom Out.
+
+### Novas Funções de Controle de Terminal
+
+Quatro funções de controle de terminal foram introduzidas para habilitar a leitura não bloqueante do teclado no modo interativo:
+
+- enable_raw_mode() / disable_raw_mode(): Salvam as configurações originais do terminal e aplicam/restauram o modo raw, desabilitando ICANON (modo canônico) e ECHO. O atexit(disable_raw_mode) garante que o modo original seja restaurado ao sair do programa.
+
+- kbhit(): Utiliza select() em conjunto com uma timeval de 0 para verificar se há dados disponíveis para leitura no STDIN_FILENO sem bloquear o processo.
+
+- getch_nonblock(): Lê um único caractere do STDIN_FILENO. Graças ao modo raw, esta chamada retorna imediatamente, mesmo que nenhuma tecla tenha sido pressionada.
 
 </details>
 
@@ -1172,25 +1190,26 @@ sudo ./pixel_test
 ## Execução na Placa
 
 ```bash
-# Console serial ou SSH
-sudo ./pixel_test
+# Encontre o repósitorio do projeto através do comando cd ./Etapa3Hps
+# Execute o comando make build seguido do comando make run
 
 # Saída esperada:
 === INICIANDO API ===
 DEBUG: Tentando abrir /dev/mem...
 DEBUG: iniciarAPI() retornou: 0
 API OK!
-DEBUG: Status inicial DONE = 1
+DEBUG: reset_system() executado.
 
---- MENU DE TESTES ---
-1. Vizinho Próximo (NHI)
-2. Replicação
-3. Decimação
-4. Média de Blocos
-5. Verificar Status
-6. Enviar imagem BMP
-7. Sair
-Opção:
+╔═════════════════════════════════════╗
+║ MENU PRINCIPAL                      ║
+╠═════════════════════════════════════╣
+║ [1]-> Modo Zoom Interativo (+/-)     ║
+║ [2]-> Enviar imagem BMP (320x240)    ║
+║ [3]-> Reset                          ║
+║ [4]-> Sair                           ║
+╚═════════════════════════════════════╝
+Nível de Zoom Atual: 1x
+→ Opção:
 ```
 
 </details>
@@ -1258,7 +1277,7 @@ Compile o projeto e programe na placa DE1-SoC através da opção "Programmer".
 
 ### Passo 3: Execução
 
-Transfira a pasta "ArquivosHPS" para o HPS da placa DE1-SoC, feito isso, utilize os seguintes comandos no terminal Linux para executar os programas: 
+Transfira a pasta "Etapa3Hps" para o HPS da placa DE1-SoC, feito isso, utilize os seguintes comandos no terminal Linux para executar os programas: 
 
 ```bash
 make build
@@ -1276,124 +1295,140 @@ sudo make run
 DEBUG: Tentando abrir /dev/mem...
 DEBUG: iniciarAPI() retornou: 0
 API OK!
-DEBUG: Status inicial DONE = 1
+DEBUG: reset_system() executado.
 
---- MENU DE TESTES ---
-1. Vizinho Próximo (NHI)
-2. Replicação
-3. Decimação
-4. Média de Blocos
-5. Verificar Status (Flag Done)
-6. Enviar imagem BMP
-7. Sair
-Opção:
+╔═════════════════════════════════════╗
+║ MENU PRINCIPAL                      ║
+╠═════════════════════════════════════╣
+║ [1]-> Modo Zoom Interativo (+/-)     ║
+║ [2]-> Enviar imagem BMP (320x240)    ║
+║ [3]-> Reset                          ║
+║ [4]-> Sair                           ║
+╚═════════════════════════════════════╝
+Nível de Zoom Atual: 1x
+→ Opção:
 ```
 
 ---
 
-### Opção 1-4: Executar Algoritmo
-
-**Exemplo: Executar Replicação com zoom 2x**
+### Opção 1: Seleção de Janela com Mouse
 
 ```
-Opção: 2
+Opção: 1
 
-Escolha o zoom:
-(1) 1x  - Sem zoom
-(2) 2x  - Zoom 2x
-(3) 4x  - Zoom 4x
-Opção: 2
+Passo 1: Selecione a janela com o mouse.
 
-Executando Replicação (zoom=2x)...
-Operação concluída com sucesso!
-```
+╔═════════════════════════════════════╗
+║ SELEÇÃO DE JANELA (MOUSE)           ║
+╠═════════════════════════════════════╣
+║ Imagem base: 320x240 pixels         ║
+║ Dimensão Mínima Requerida: > 50x50  ║
+║ Clique com o BOTÃO ESQUERDO duas vezes. ║
+║ Pressione Ctrl+C para cancelar.     ║
+╚═════════════════════════════════════╝
+Cursor Virtual: X=160, Y=120. Aguardando Ponto A...
 
-**Resultado:** Imagem processada exibida no monitor VGA.
+# ... Usuário move o mouse e clica no Ponto A e depois no Ponto B ...
 
-**Algoritmos disponíveis:**
+✓ JANELA SELECIONADA
+Posição inicial: (X_INICIO, Y_INICIO)
+Dimensões: LARGURA x ALTURA pixels
 
-| Opção | Algoritmo | Descrição | Uso Típico |
-|-------|-----------|-----------|------------|
-| 1 | **NHI** (Nearest Neighbor) | Interpolação por vizinho mais próximo | Zoom in com preservação de bordas |
-| 2 | **Replicação** | Duplica pixels diretamente | Zoom in rápido, efeito pixelado |
-| 3 | **Decimação** | Remove pixels alternados | Zoom out, redução de resolução |
-| 4 | **Média de Blocos** | Calcula média de regiões | Zoom out suave, anti-aliasing |
+# Validação (Exemplo de Erro, que forçaria a re-seleção)
+ERRO: A dimensão mínima de 50x50 pixels não foi atingida. Selecionado: 40x40.
+Ambas as dimensões devem ser estritamente maiores que 50 para serem válidas. Por favor, selecione novamente.
+
+Passo 2: Configuração da Janela (FPGA)
+
+A janela validada é enviada ao hardware.
+
+Passo 3: Escolha de Algoritmos
+
+O usuário seleciona os algoritmos que serão usados para as operações de zoom (teclas + e -):
+# Escolha do Zoom In
+╔═════════════════════════════════════╗
+║ ESCOLHA OS ALGORITMOS               ║
+╠═════════════════════════════════════╣
+║ Algoritmo para Zoom In:             ║
+║ [1] Vizinho Próximo (NHI)           ║
+║ [2] Replicação                      ║
+╚═════════════════════════════════════╝
+→ Escolha: 1
+
+# Escolha do Zoom Out
+╔═════════════════════════════════════╗
+║ Algoritmo para Zoom Out:            ║
+║ [3] Decimação                       ║
+║ [4] Média de Blocos                 ║
+╚═════════════════════════════════════╝
+→ Escolha: 3
+
+Passo 4: Execução Interativa (Teclado)
+
+O programa entra em modo raw, onde o teclado é usado para controlar o zoom:
+╔═════════════════════════════════════════════╗
+║ MODO INTERATIVO DE ZOOM                     ║
+╠═════════════════════════════════════════════╣
+║ Pressione '+' para Zoom In (magnificar)     ║
+║ Pressione '-' para Zoom Out (reduzir)       ║
+║ Pressione 'q' ou 'ESC' para sair            ║
+╠═════════════════════════════════════════════╣
+║ Algoritmo Zoom In: Vizinho Próximo (NHI)    ║
+║ Algoritmo Zoom Out: Decimação               ║
+╚═════════════════════════════════════════════╝
+
+Nível atual: 1x - Aguardando comando...
+
+# Exemplo de Comando
+(pressiona '+')
+
+Aplicando Zoom In (NHI) -> 2x... 
+✓ Zoom aplicado com sucesso! Nível atual: 2x
+Nível atual: 2x - Aguardando comando...
 
 ---
 
-### Opção 5: Verificar Status
+### Opção 5: Enviar Imagem BMP (320x240)
 
 ```
-Opção: 5
-
-Status: Hardware PRONTO (Done=1)
-```
-
-**Interpretação:**
-- `PRONTO (Done=1)`: Hardware disponível para nova operação;
-- `OCUPADO (Done=0)`: Processamento em andamento.
-
----
-
-### Opção 6: Carregar Imagem BMP
+Opção 2
 
 ```
-Opção: 6
 
-Digite o caminho da imagem BMP (160x120): ./ImgGalinha.bmp
-
-Dimensões: 160x120 pixels
-Bits por pixel: 24
+Digite o caminho da imagem BMP (320x240): ./minha_imagem.bmp
 
 Enviando imagem...
-Progresso: 19200/19200 pixels (100.0%)
+Progresso: XXXXX/76800 pixels (YY.Y%) 
+Progresso: 76800/76800 pixels (100.0%) 
 Imagem enviada com sucesso!
 Imagem carregada na RAM1!
-```
-
-**Formatos suportados:**
-- BMP 8 bits (grayscale direto);
-- BMP 24 bits (RGB convertido automaticamente).
-
-**Requisitos:**
-- Dimensões: exatamente 160×120 pixels;
-- Sem compressão (compression=0).
 
 ---
 
-### Opção 7: Sair
+### Opção 3: Reset
 
 ```
-Opção: 7
+
+Opção: 3
+```
+
+Sistema resetado (Limpo)!
+
+---
+
+### Opção 4: Sair
+
+```
+Opção: 4
+
+```
 
 Saindo...
 Encerrando API... OK!
+
+
 ```
-
-Sistema desmapeia memória e encerra corretamente.
-
 ---
-
-### Fluxo de Uso Típico
-
-```
-1. Iniciar programa
-   └─> sudo ./pixel_test
-
-2. Carregar imagem
-   └─> Opção 6 > ./ImgGalinha.bmp
-
-3. Processar imagem
-   └─> Opção 1 > Zoom 2x (NHI)
-   └─> Ver resultado no monitor VGA
-
-4. Experimentar outros algoritmos
-   └─> Opção 2 > Zoom 4x (Replicação)
-   └─> Opção 4 > Zoom 2x (Média)
-
-5. Sair
-   └─> Opção 7
-```
 
 </details>
 
@@ -1411,6 +1446,10 @@ Sistema desmapeia memória e encerra corretamente.
 
 ---
 
+**Teste final do projeto**
+
+
+
 ### Análise de Resultados
 
 #### ✅ Pontos Fortes
@@ -1423,10 +1462,16 @@ Sistema desmapeia memória e encerra corretamente.
    - Todos os 4 algoritmos produzem resultados corretos;
    - Qualidade visual conforme esperado.
 
-3. **Tratamento de erros**
-   - Timeout funciona corretamente.
+3. **Redimensionamento na janela**
+   - O redimensionamento ocorre corretamento dentro da janela escolhida pelo usuário.
 
-4. **Modularidade**
+4. **Efeito de lupa**
+   - É possível visualizar a imagem original atrás da janela de redimensionamento, dessa forma criando o efeito de lupa esperado.
+  
+4. **Tratamento de erros**
+   - Mensagens de erro relacionadas ao envio de imagem, limites de dimensão de janela e fatores máximos e mínimos de zoom são exibidas quando necessário.
+
+5. **Modularidade**
    - Código fácil de manter e expandir;
    - Separação clara entre camadas.
 
@@ -1434,34 +1479,17 @@ Sistema desmapeia memória e encerra corretamente.
 
 #### ⚠️ Limitações Identificadas
 
-1. **Timeout Fixo**
-   - 3M iterações insuficiente para zoom maior que 4x;
-   - **Solução:** Timeout adaptativo baseado em zoom.
-
-2. **Formato de Imagem**
-   - Apenas BMP suportado;
-   - **Expansão:** Adicionar PNG, JPEG via libpng/libjpeg.
-
-3. **Sem Feedback Visual**
-   - Usuário não vê progresso do processamento;
-   - **Melhoria:** Adicionar barra de progresso.
+1. **Tamanhos limites para a janela**
+   - A janela não pode ter dimensões menores que 50x50, maiores que 180x180 para zooms de 2x ou maiores que 130x130 para zooms de 4x;
+   - **Melhoria:** Remediar limitações de dimensão.
 
 ---
 
 ### Bugs Corrigidos Durante Desenvolvimento
 
-1. **Bug:** DONE sempre retorna 0
-   - **Causa:** Clock enable não conectado;
-   - **Solução:** Conectar `clk_en` na FSM principal.
-
-2. **Bug:** Imagem invertida verticalmente
-   - **Causa:** BMP armazena bottom-up;
-   - **Solução:** Inverter ordem de leitura no C.
-
-3. **Bug** Nova imagem carregada muito lentamente na memória
-   - **Causa:** Polling na função write_pixel causando atraso desnecessário no carregamento dos pixels;
-   - **Solução:** Remoção do polling.
-
+1. **Bug:** Janela amplia de tamanho ao invés de ser fixa.
+   - **Causa:** Cálculo incorreto das dimensões da janela;
+   - **Solução:** Dimensões não são mais multiplicadas pelo fator de zoom..
 
 </details>
 
@@ -1479,7 +1507,7 @@ Sistema desmapeia memória e encerra corretamente.
 | Carregamento BMP | ✅ 100% | Suporta 8 e 24 bits |
 | 4 Algoritmos funcionais | ✅ 100% | NHI, Replicação, Decimação, Média |
 | Saída VGA | ✅ 100% | 640×480 @ 60Hz |
-| Aplicação C (Etapa 3) | 🔄 80% | Menu funcional para testes da etapa 2, falta controle por teclado para etapa 3|
+| Aplicação C (Etapa 3) | 100% | Captura do mouse 100% funcional, assim como o uso do teclado para o fator de zoom|
 | Documentação completa | ✅ 100% | README + comentários no código |
 
 ---
@@ -1542,48 +1570,9 @@ Sistema desmapeia memória e encerra corretamente.
 - Cabo USB-Blaster;
 - Cabo USB-Serial (FTDI);
 - Fonte 12V/2A.
+- Mouse P/2.
 
 ---
-
-### Estrutura de Arquivos do Projeto
-
-```
-projeto/
-├── hardware/
-│   ├── ghrd_top.v                  # Top-level com HPS
-│   ├── UnidadeControle.v           # FSM principal
-│   ├── ControladorRedimensionamento.v
-│   ├── FSM_Escrita.v               # FSM de escrita
-│   ├── Replicacao.v                # Algoritmos
-│   ├── Decimacao.v
-│   ├── NHI.v
-│   ├── MediaBlocos.v
-│   ├── RAM_DualPort.v              # Memória 76.800 pixels
-│   ├── VGA_Controller.v
-│   └── soc_system.qsys             # Platform Designer
-│
-├── software/
-│   ├── api.s                       # API Assembly
-│   ├── main.c                      # Aplicação C
-│   ├── header.h                    # Protótipos
-│   ├── Makefile                    # Build script
-│   └── ImgGalinha.bmp              # Imagem de teste
-│
-├── docs/
-│   ├── README.md                   # Este arquivo
-│   ├── Diagramas/
-│   │   ├── Arquitetura.png
-│   │   ├── FSM_Principal.png
-│   │   └── Fluxo_Dados.png
-│   └── Resultados/
-│       ├── Screenshot_NHI.jpg
-│       └── Screenshot_Replicacao.jpg
-│
-└── tests/
-    ├── test_write_pixel.c
-    ├── test_algorithms.c
-    └── test_bmp_loader.c
-```
 
 </details>
 
