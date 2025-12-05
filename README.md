@@ -442,10 +442,10 @@ O módulo UnidadeControle (coprocessador) é conectado ao sistema através de:
 | `PIO_INSTRUCT` | 0x00 | R/W | Instrução (opcode + zoom + flags) |
 | `PIO_START` | 0x30 | W | Sinal de início (pulso) |
 | `PIO_DONE` | 0x20 | R | Flag de conclusão |
-| `PIO_RESET` | 0x40 | R | Flag de escrita concluída |
-| `PIO_JANELA_POS` | 0x50 | R | Flag de escrita concluída |
-| `PIO_JANELA_DIM` | 0x60 | R | Flag de escrita concluída |
-| `PIO_COORDS_MOUSE` | 0x70 | R | Flag de escrita concluída |
+| `PIO_RESET` | 0x40 | W | Pulso de reset lógico/limpeza do sistema |
+| `PIO_JANELA_POS` | 0x50 | W | Coordenadas X/Y de início da Janela |
+| `PIO_JANELA_DIM` | 0x60 | W | Largura/Altura da Janela |
+| `PIO_COORDS_MOUSE` | 0x70 | W | Coordenadas do mouse |
 
 **Mapeamento de Memória:**
 ```
@@ -494,9 +494,51 @@ VRAM Virtual: 0 - 19199 (160×120 pixels)
 - `Endereço [19:5]`: Posição na VRAM (0-19199);
 - `WE [4]`: Write Enable (1 para escrever).
 
+#### Instrução de Posição da Janela
+```
+31                                     17 16      9  8        0
+┌─────────────────────────────────────────┬─────────┬───────────┐
+│                Reservado                │y_inicio │ x_inicio  │
+│                 (15 bits)               │(8 bits) │ (9 bits)  │
+└─────────────────────────────────────────┴─────────┴───────────┘
+```
+
+**Campos:**
+- `x_inicio [8:0]`: Coordenada X inicial da Janela.
+- `y_inicio [16:9]`: Coordenada Y inicial da Janela.
+
+#### Instrução de Dimensão da Janela
+```
+ 31                                     17 16      9  8        0
+┌─────────────────────────────────────────┬─────────┬───────────┐
+│                Reservado                │ Altura  │ Largura   │
+│                 (15 bits)               │(8 bits) │ (9 bits)  │
+└─────────────────────────────────────────┴─────────┴───────────┘
+```
+
+**Campos:**
+- `Largura [8:0]`: Largura da janela.
+- `Altura [16:9]`: Altura da janela.
+
+#### Instrução de Coordenadas do Mouse
+```
+  31                                     21 20      10 9        0
+┌─────────────────────────────────────────┬──────────┬───────────┐
+│                Reservado                │ Coord Y  │  Coorde X │
+│                 (11 bits)               │ (11 bits)│ (10 bits) │
+└─────────────────────────────────────────┴──────────┴───────────┘
+
+```
+
+**Campos:**
+- `Coordenada X [9:0]`: Posição X global na tela VGA (0 a 639).
+- `Coordenada Y [20:10]`: Posição Y global na tela VGA (0 a 479).
+
+
+
 ---
 
-### Funções da API Assembly
+### Funções da API Assembly adicionadas na terceira etapa
 
 **Conceito Fundamental: Memory-Mapped I/O**
 
@@ -513,859 +555,189 @@ A FPGA não é acessada como um "dispositivo externo", mas sim como se fosse **m
 └─────────────────────────────────────┘
 ```
 
-#### 1️⃣ `iniciarAPI()` - Inicialização
+#### 1️⃣ `reset_system()` - Reset do Sistema FPGA
 
-Estabelece a conexão entre o processador ARM (HPS) e a FPGA através de memory mapping.
-
-**Propósito:** Abrir `/dev/mem` e mapear região FPGA na memória virtual.
-
----
-
-##### **ETAPA 1: Abrir `/dev/mem`**
-
-```assembly
-LDR r0, =.LC0          ; r0 = "/dev/mem"
-LDR r1, =4098          ; r1 = O_RDWR | O_SYNC
-MOV r2, #0             ; r2 = mode (não usado)
-MOV r7, #5             ; syscall 5 = open()
-SVC 0                  ; Chama kernel
-MOV r4, r0             ; r4 = file descriptor retornado
-```
-
-**O que é `/dev/mem`?**
-- Arquivo especial do Linux que representa **toda a memória física**;
-- Requer permissões root;
-- Permite acesso direto ao hardware (perigoso mas necessário).
-
-**Flags importantes:**
-- `O_RDWR` (2) = leitura + escrita;
-- `O_SYNC` (4096) = sincronização imediata com hardware;
-- Total: 4098 = 2 + 4096.
-
-**Verificação de erro:**
-```assembly
-CMP r4, #-1            ; open() retorna -1 em erro
-BNE .L_MMAP_Setup      ; Se != -1, sucesso
-LDR r0, =.LC1          ; Senão, imprime erro
-BL puts
-```
-
----
-
-##### **ETAPA 2: Mapear Memória com `mmap()`**
-
-Esta é a parte mais importante! O `mmap()` cria uma "janela" no espaço de endereços do processo ARM que aponta diretamente para a FPGA.
-
-```assembly
-MOV r0, #0             ; addr = NULL (kernel escolhe endereço)
-LDR r1, =LW_SPAM       
-LDR r1, [r1]           ; r1 = 0x1000 (4096 bytes = tamanho)
-MOV r2, #3             ; r2 = PROT_READ | PROT_WRITE
-MOV r3, #1             ; r3 = MAP_SHARED
-LDR r4, =FILE_DESCRIPTOR
-LDR r4, [r4]           ; r4 = fd do /dev/mem
-LDR r5, =LW_BASE
-LDR r5, [r5]           ; r5 = 0xFF200 (endereço físico)
-MOV r7, #192           ; syscall 192 = mmap()
-SVC 0
-```
-
-**Parâmetros do mmap() explicados:**
-
-| Registrador | Valor | Significado |
-|-------------|-------|-------------|
-| **r0** | NULL | Kernel escolhe onde mapear |
-| **r1** | 0x1000 | Mapeia 4KB (tamanho da região) |
-| **r2** | 3 | `PROT_READ \| PROT_WRITE` (leitura + escrita) |
-| **r3** | 1 | `MAP_SHARED` (mudanças afetam hardware) |
-| **r4** | fd | File descriptor do `/dev/mem` |
-| **r5** | 0xFF200 | **Offset físico da FPGA** |
-
-**O que acontece internamente:**
-
-```
-ANTES do mmap():
-┌─────────────────────────────────┐
-│ Processo ARM (espaço virtual)   │
-├─────────────────────────────────┤
-│ Código                          │
-│ Dados                           │
-│ Heap                            │
-│ Stack                           │
-└─────────────────────────────────┘
-         ❌ Não vê a FPGA
-
-
-DEPOIS do mmap():
-┌─────────────────────────────────┐
-│ Processo ARM (espaço virtual)   │
-├─────────────────────────────────┤
-│ Código                          │
-│ Dados                           │
-│ Heap                            │
-│ Stack                           │
-│ ┌─────────────────────────────┐ │
-│ │ Janela mapeada (0xXXXXXXXX) │ │◄── Retornado em r0
-│ │  ↓ aponta para ↓            │ │
-│ │  FPGA (0xFF200000)          │ │
-│ └─────────────────────────────┘ │
-└─────────────────────────────────┘
-         ✅ Pode acessar FPGA!
-```
-
-**Por que 0xFF200 e não 0xFF200000?**
-
-```assembly
-LW_BASE: .word 0xff200    ; Apenas offset, não endereço completo.
-```
-
-O kernel do Linux **adiciona zeros automaticamente** porque:
-- O offset do `mmap()` deve ser múltiplo do tamanho da página (4KB = 0x1000);
-- 0xFF200 na verdade representa 0xFF200**000** (deslocado 12 bits).
-- Isso é uma convenção da syscall `mmap()`.
-
----
-
-##### **ETAPA 3: Salvar Ponteiro Virtual**
-
-```assembly
-MOV r4, r0             ; r4 = ponteiro virtual retornado
-LDR r1, =FPGA_ADRS
-STR r4, [r1]           ; Salva em variável global
-```
-
-**O que é esse ponteiro?**
-- Endereço virtual no espaço do processo (ex: 0xB6F00000);
-- Quando você escreve nesse endereço, o kernel traduz para 0xFF200000 (físico);
-- É isso que permite `STR r2, [r4, #0x00]` escrever direto na FPGA.
-
-**Fluxo completo após mapeamento:**
-
-```
-1. CPU ARM executa: STR r2, [r4, #0x00]
-                          ↓
-2. MMU traduz: endereço virtual → 0xFF200000 (físico)
-                          ↓
-3. Barramento AXI encaminha para Lightweight Bridge
-                          ↓
-4. Bridge conecta ao Avalon Bus da FPGA
-                          ↓
-5. PIO recebe escrita no offset 0x00
-                          ↓
-6. Hardware FPGA processa!
-```
-
----
-
-#### 2️⃣ `encerrarAPI()` - Finalização
-
-Libera recursos e fecha a conexão.
-
-##### **ETAPA 1: Desmapear memória**
-
-```assembly
-LDR r0, =FPGA_ADRS
-LDR r0, [r0]           ; r0 = ponteiro virtual
-LDR r1, =LW_SPAM
-LDR r1, [r1]           ; r1 = 0x1000 (tamanho)
-MOV r7, #91            ; syscall 91 = munmap()
-SVC 0
-```
-
-**O que faz:**
-- Remove a "janela" do espaço de endereços
-- Libera recursos do kernel
-- Tenta acessar `FPGA_ADRS` depois disso = **Segmentation Fault**!
-
-##### **ETAPA 2: Fechar arquivo**
-
-```assembly
-LDR r0, =FILE_DESCRIPTOR
-LDR r0, [r0]
-MOV r7, #6             ; syscall 6 = close()
-SVC 0
-```
-
-Fecha o `/dev/mem`, liberando o file descriptor.
-
-**Retorno:** 0 (sucesso) ou -1 (erro)
-
----
-
-### Funções de comando para FPGA
-
-### 3️⃣ `write_pixel(address, pixel_data)` - Escrita de Pixel
-
-Escreve um pixel na VRAM da FPGA usando protocolo de handshake de 2 etapas.
-
-**Parâmetros:**
-- `r0`: Endereço do pixel (0-19199);
-- `r1`: Valor do pixel em grayscale (0-255).
-
+Reinicia o hardware da FPGA através de um pulso de reset, retornando todos os módulos ao estado inicial.
+**Propósito:** Limpar estados internos, resetar máquinas de estado e preparar o sistema para nova operação.
+**Parâmetros:** Nenhum
 **Retorno:**
-- `0`: Sucesso;
-- `-1`: Endereço inválido.
+	0: Sucesso
 
 ---
 
-##### **ETAPA 1: Validação e Carregamento do Ponteiro**
+##### **ETAPA 1: Ativação do Reset (LOW)**
 
 ```assembly
-push    {r4-r6, lr}        ; Salva contexto
-ldr     r4, =FPGA_ADRS
-ldr     r4, [r4]           ; r4 = ponteiro para FPGA
-
-cmp     r0, #19200         ; Verifica se endereço < 19200
-bhs     .L_INVALID_ADDR    ; Branch if Higher or Same (unsigned)
+mov r0, #0
+str r0, [r4, #PIO_RESET]
+dmb sy
 ```
 
-**Por que 19200?**
-- Imagem: 160×120 pixels = 19.200 pixels totais;
-- Endereços válidos: 0 até 19199;
-- Qualquer valor ≥ 19200 causa overflow na VRAM.
+**O que acontece**:
 
----
+Escreve 0 no registrador PIO_RESET (offset 0x40)
+Na FPGA, isso ativa o sinal de reset (lógica negativa)
+Todos os módulos entram em estado de reset:
+	- FSMs retornam ao estado inicial
+	- Registradores internos são zerados
+	- Flags de controle são limpas
+	
+*Por que lógica LOW?*
+Convenção comum em hardware: reset ativo em nível baixo (active-low).
 
-##### **ETAPA 2: Empacotamento do Endereço (bits [19:5])**
+##### **ETAPA 2: Desativação do Reset (HIGH)**
 
 ```assembly
-.L_PACK_DATA:
-    lsl     r2, r0, #5           ; Desloca endereço 5 bits à esquerda
-    ldr     r6, =MASK_ADDR       ; Carrega máscara
-    ldr     r6, [r6]             ; r6 = 0x000FFFE0
-    and     r2, r2, r6           ; Aplica máscara
+mov r0, #1
+str r0, [r4, #PIO_RESET]
+dmb sy
 ```
 
 **O que acontece:**
 
-```
-Exemplo: endereço = 100 (0x64)
-
-1. Shift left 5 bits:
-   0x64 << 5 = 0xC80 = 0b110010000000
-
-2. Aplicar máscara 0x000FFFE0:
-   0x00000C80 & 0x000FFFE0 = 0x00000C80
-   
-   Resultado: endereço nos bits [19:5]
-```
-
-**Por que shift de 5 bits?**
-- O hardware espera endereço nos bits **[19:5]** do registrador PIO;
-- Bits [4:0] são reservados para flags e opcode;
-- Isso permite endereçar até 2^15 = 32.768 pixels.
+Escreve 1 no registrador PIO_RESET
+Libera os módulos do estado de reset
+Hardware retorna à operação normal, mas com estado limpo
 
 ---
 
-##### **ETAPA 3: Empacotamento do Pixel (bits [27:20])**
+#### 2️⃣ `set_janela()` - Configuração de Janela de Processamento
+
+Define uma região retangular (janela) da imagem onde os algoritmos de processamento serão aplicados.
+**Propósito:** Enviar os parâmetros necessários para o hardware processar apenas uma área específica da imagem.
+**Parâmetros:**
+	- r0: x_inicio - Coordenada X inicial (0-159)
+	- r1: y_inicio - Coordenada Y inicial (0-119)
+	- r2: largura - Largura da janela em pixels (1-160)
+	- r3: altura - Altura da janela em pixels (1-120)
+**Retorno:**
+	- 0: Sucesso
+
+---
+
+##### **ETAPA 1: Empacotamento da Posição (PIO_JANELA_POS)**
 
 ```assembly
-lsl     r3, r1, #20          ; Desloca pixel 20 bits à esquerda
-and     r3, r3, #0x0FF00000  ; Mascara 8 bits
-orr     r2, r2, r3           ; Combina endereço + pixel
+and r0, r0, #0xFF       ; Mascara x_inicio (9 bits válidos)
+and r1, r1, #0xFF       ; Mascara y_inicio (8 bits válidos)
+lsl r5, r1, #9          ; Desloca y_inicio 9 bits à esquerda
+orr r5, r5, r0          ; Combina: (y << 9) | x
 ```
 
-**Formato do pacote parcial:**
-
+**Exemplo:**
 ```
- 31      28 27      20 19           5  4     0
-┌──────────┬──────────┬──────────────┬───── ─┐
-│   0000   │  Pixel   │   Endereço   │ 00000 │
-│ (4 bits) │ (8 bits) │  (15 bits)   │(5bits)│
-└──────────┴──────────┴──────────────┴───── ─┘
+x_inicio = 40, y_inicio = 30
+
+1. Máscara: x = 0x28, y = 0x1E
+2. Deslocamento: y << 9 = 0x1E << 9 = 0x3C00
+3. Combinação: 0x3C00 | 0x28 = 0x3C28
+
+Resultado: 0x00003C28
+           = 0000 0000 0000 0000 0011 1100 0010 1000
+             ^^^^^^^^^^^^^^^ ^^^^^^^^ ^^^^^^^^^
+             Reservado       y=30     x=40
 ```
 
-**Exemplo completo:**
-```
-Endereço = 100, Pixel = 0xFF (branco)
+##### **ETAPA 2: Envio da Posição**
 
-Após shift e máscara:
-  Endereço: 0x00000C80 (bits [19:5])
-  Pixel:    0x0FF00000 (bits [27:20])
-  
-ORR (combinar):
-  0x00000C80 | 0x0FF00000 = 0x0FF00C80
+```assembly
+str r5, [r4, #PIO_JANELA_POS]
+dmb sy
+```
+
+Escreve no registrador PIO_JANELA_POS (offset 0x50) e garante sincronização.
+
+##### **ETAPA 3: Empacotamento das Dimensões (PIO_JANELA_DIM)**
+
+```assembly
+and r2, r2, #0xFF       ; Mascara largura
+and r3, r3, #0xFF       ; Mascara altura
+lsl r5, r3, #9          ; Desloca altura 9 bits
+orr r5, r5, r2          ; Combina: (altura << 9) | largura
+```
+
+**Exemplo:**
+```
+largura = 80, altura = 60
+
+1. Máscara: largura = 0x50, altura = 0x3C
+2. Deslocamento: altura << 9 = 0x3C << 9 = 0x7800
+3. Combinação: 0x7800 | 0x50 = 0x7850
+
+Resultado: 0x00007850
+```
+
+##### **ETAPA 4: Envio das Dimensões**
+
+```assembly
+str r5, [r4, #PIO_JANELA_DIM]
+dmb sy
+```
+
+Escreve no registrador `PIO_JANELA_DIM` (offset `0x60`).
+
+---
+
+### 3️⃣ `write_mouse_coords()` - Envio de Coordenadas do Mouse
+
+Envia as coordenadas do cursor do mouse para a FPGA, permitindo interação com o hardware.
+**Propósito:** Comunicar posição do mouse para controle de interface.
+**Parâmetros:**
+	- r0: x_coords - Coordenada X do mouse (0-639).
+	- r1: y_coords - Coordenada Y do mouse (0-479).
+**Retorno:**
+	- 0: Sucesso
+
+---
+
+##### **ETAPA 1: Validação e Mascaramento**
+
+```assembly
+ldr     r5, =0x3FF         ; 0x3FF = 1023 = 10 bits
+and     r0, r0, r5         ; Garante X dentro de 10 bits
+and     r1, r1, r5         ; Garante Y dentro de 10 bits
 ```
 
 ---
 
-##### **ETAPA 4: Ativar Flag de Escrita (bit [4])**
+##### **ETAPA 2: Empacotamento das Coordenadas**
 
 ```assembly
-mov     r3, #1
-lsl     r3, r3, #4           ; r3 = 0x10 (bit 4 ativado)
-orr     r2, r2, r3           ; Adiciona flag SolicitaEscrita
+lsl     r5, r1, #10        ; Desloca Y 10 bits à esquerda
+orr     r5, r5, r0         ; Combina: (Y << 10) | X
 ```
 
-**Pacote completo com SolicitaEscrita=1:**
-
+**Exemplo: Mouse em (320, 240) - centro da tela VGA**
 ```
- 31      28 27      20 19           5  4    3    0
-┌──────────┬──────────┬──────────────┬────┬───── ─┐
-│   0000   │  Pixel   │   Endereço   │ 1  │ 0000  │
-│ (4 bits) │ (8 bits) │  (15 bits)   │(WE)│(4bits)│
-└──────────┴──────────┴──────────────┴────┴────── ┘
+x_coords = 320 (0x140)
+y_coords = 240 (0x0F0)
 
-Exemplo: 0x0FF00C90
-         = 0000 1111 1111 0000 0000 1100 1001 0000
-           ^^^^ ^^^^^^^^      ^^^^^^^^^^^^^ ^
-           Res.  Pixel=0xFF   Addr=100     WE=1
+1. Aplicar máscara:
+   x = 320 & 0x3FF = 0x140
+   y = 240 & 0x3FF = 0x0F0
+
+2. Deslocar Y:
+   y << 10 = 0x0F0 << 10 = 0x3C000
+
+3. Combinar:
+   0x3C000 | 0x140 = 0x3C140
+
+Resultado: 0x0003C140
+           = 0000 0000 0000 0011 1100 0001 0100 0000
+             ^^^^^^^^^^^^ ^^^^^^^^^^ ^^^^^^^^^^
+             Reservado    y=240      x=320
 ```
 
 ---
 
-##### **ETAPA 5: Enviar Primeiro Pacote (WE=1)**
+##### **ETAPA 3: ETAPA 3: Envio para FPGA**
 
 ```assembly
-str     r2, [r4, #PIO_INSTRUCT]  ; Escreve no registrador da FPGA
-dmb     sy                        ; Data Memory Barrier
-```
-
-**O que acontece na FPGA:**
-1. PIO detecta escrita no registrador `PIO_INSTRUCT`;
-2. FSM de Escrita lê o bit `SolicitaEscrita` (bit 4) = **1**;
-3. Hardware **armazena** endereço e pixel, mas **ainda não grava na RAM**;
-4. Aguarda pulso de confirmação (transição 1→0);
-
-**Por que DMB SY?**
-```assembly
-dmb sy  @ Data Memory Barrier - System
-```
-- **Garante que a escrita STR seja completada** antes de prosseguir;
-- Previne reordenação de instruções pelo pipeline ARM;
-- Essencial para sincronização CPU ↔ Hardware.
-
-Sem DMB, o processador poderia:
-```
-STR r2, [r4, #PIO_INSTRUCT]  ; Enfileirado no store buffer
-BIC r2, r2, r3                ; Executado imediatamente!
-STR r2, [r4, #PIO_INSTRUCT]  ; FPGA vê ambos fora de ordem!
-```
-
----
-
-##### **ETAPA 6: Limpar Flag de Escrita (bit [4])**
-
-```assembly
-bic     r2, r2, r3           ; BIC = Bit Clear (limpa bit 4)
-str     r2, [r4, #PIO_INSTRUCT]
+str     r5, [r4, #PIO_COORDS_MOUSE]
 dmb     sy
 ```
 
-**Pacote com SolicitaEscrita=0:**
-
-```
- 31      28 27      20 19           5  4    3    0
-┌──────────┬──────────┬──────────────┬────┬─── ───┐
-│   0000   │  Pixel   │   Endereço   │ 0  │ 0000  │ ← Bit 4 = 0
-│ (4 bits) │ (8 bits) │  (15 bits)   │(WE)│(4bits)│
-└──────────┴──────────┴──────────────┴────┴──── ──┘
-```
-
----
-
-#### **Por Que 2 Envios? (Protocolo de Pulso)**
-
-A FPGA detecta uma **transição de borda** (1→0) para confirmar a escrita:
-
-```
-        ┌─────┐
-WE:  ───┘     └─────  (Pulso de escrita)
-        
-        t1    t2
-        ↑     ↑
-     Prepara  Grava!
-```
-
-**Sequência temporal:**
-1. **t1**: CPU escreve com `WE=1` → FPGA captura endereço e pixel;
-2. **DMB**: Garante que escrita chegou ao hardware;
-3. **t2**: CPU escreve com `WE=0` → FPGA detecta borda 1→0;
-4. **Resultado**: FSM de Escrita grava pixel na RAM.
-
-**Sem o segundo envio:**
-```
-WE sempre = 1  →  FPGA não sabe quando gravar!
-```
-
----
-
-#### **ETAPA 7: Tratamento de Erros e Retorno**
-
-```assembly
-b       .L_EXIT              ; Vai para retorno de sucesso
-
-.L_INVALID_ADDR:
-    mov     r0, #-1          ; Retorna -1 (erro)
-    b       .L_EXIT
-
-.L_EXIT:
-    mov     r0, #0           ; Retorna 0 (sucesso)
-    pop     {r4-r6, pc}      ; Restaura contexto e retorna
-```
-
----
-
-## 🔍 Diagrama Completo do Fluxo
-
-```
-┌─────────────────────────────────────────────┐
-│   write_pixel(100, 0xFF)                    │
-└───────────────────┬─────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│   1. Validar endereço < 19200               │
-│       OK                                    │
-└───────────────────┬─────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│   2. Empacotar dados:                       │
-│      • Addr=100 → bits[19:5] = 0x00000C80   │
-│      • Pixel=0xFF → bits[27:20] = 0x0FF00000│
-│      • WE=1 → bit[4] = 0x10                 │
-│      Resultado: 0x0FF00C90                  │
-└───────────────────┬─────────────────────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│   3. STR 0x0FF00C90, [FPGA+0x00]            │
-│      DMB SY ← Sincroniza                    │
-└───────────────────┬─────────────────────────┘
-                    │
-        ┌───────────▼───────────┐
-        │   FPGA PIO            │
-        │   • Lê WE=1           │
-        │   • Captura dados     │
-        │   • Aguarda pulso     │
-        └───────────┬───────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│   4. BIC r2, r2, #0x10 → 0x0FF00C80         │
-│      STR 0x0FF00C80, [FPGA+0x00]            │
-│      DMB SY                                 │
-└───────────────────┬─────────────────────────┘
-                    │
-        ┌───────────▼───────────┐
-        │   FPGA FSM Escrita    │
-        │   • Detecta 1→0       │
-        │   • Grava na RAM:     │
-        │     RAM[100] = 0xFF   │
-        └───────────┬───────────┘
-                    │
-┌───────────────────▼─────────────────────────┐
-│   5. Retorna 0 (sucesso)                    │
-└─────────────────────────────────────────────┘
-```
-
----
-
-## ⚡ Otimizações Aplicadas
-
-### ✅ **Fire-and-Forget (Sem Polling)**
-```assembly
-@ NÃO faz isso:
-.WAIT_DONE:
-    LDR r2, [r4, #PIO_DONE_WRITE]
-    TST r2, #1
-    BEQ .WAIT_DONE
-```
-
-**Por quê?**
-- Escrita de pixel é **muito rápida** (~100ns na FPGA);
-- Polling adicionaria **overhead desnecessário**;
-- CPU pode continuar preparando próximo pixel.
-
-**Trade-off:**
-- ✅ Throughput alto (até 10 milhões pixels/s);
-- ⚠️ Não há confirmação individual de erro;
-- ✅ Sistema confia na velocidade do hardware.
-
----
-
-## 🎓 Resumo da Função
-
-| Etapa | Operação | Registrador | Resultado |
-|-------|----------|-------------|-----------|
-| 1 | Validar | `r0 < 19200` | Branch se inválido |
-| 2 | Shift endereço | `r0 << 5` | Bits [19:5] |
-| 3 | Shift pixel | `r1 << 20` | Bits [27:20] |
-| 4 | Combinar | `r2 = addr \| pixel` | Pacote parcial |
-| 5 | Setar WE | `r2 \| 0x10` | Pacote com WE=1 |
-| 6 | Enviar 1 | `STR + DMB` | FPGA captura |
-| 7 | Limpar WE | `BIC bit 4` | WE=0 |
-| 8 | Enviar 2 | `STR + DMB` | FPGA grava (1→0) |
-| 9 | Retornar | `r0 = 0` | Sucesso |
-
----
-
-#### 4️⃣-7️⃣ Funções de Processamento
-
-##### Estrutura Comum dos Algoritmos
-
-Todos os algoritmos (NHI, Replicação, Decimação e Média) seguem o mesmo padrão:
-
-```
-1. Preparação → 2. Empacotamento → 3. Envio → 4. Pulso START → 5. Polling → 6. Retorno
-```
-
-**Fluxo detalhado:**
-1. **Preparação**: Salvar contexto e carregar ponteiro FPGA;
-2. **Empacotamento**: Montar instrução (opcode + zoom);
-3. **Envio**: Escrever em PIO_INSTRUCT com sincronização;
-4. **Pulso START**: Transição 1→0 para iniciar FPGA;
-5. **Polling**: Aguardar flag DONE com timeout;
-6. **Retorno**: 0 (sucesso) ou -2 (timeout).
-
----
-
-##### 🎯 Exemplo: Algoritmo NHI
-
-###### PARTE 1: Inicialização
-
-```assembly
-NHI:
-    push    {r4-r6, lr}        ; Salva registradores na pilha
-    ldr     r4, =FPGA_ADRS
-    ldr     r4, [r4]           ; r4 = ponteiro virtual para FPGA
-```
-
-**O que acontece:**
-- `push` salva o contexto (r4-r6) e endereço de retorno (lr) pela convenção AAPCS;
-- `r4` recebe o ponteiro mapeado por `iniciarAPI()` (ex: 0xB6F00000);
-- Este ponteiro permite acesso aos registradores da FPGA.
-
----
-
-###### PARTE 2: Empacotamento da Instrução
-
-```assembly
-empacotamento_instrucao_NHI:
-    mov     r2, #OPCODE_NHI    ; r2 = 0b10 (opcode do NHI)
-    and     r0, r0, #0x03      ; Mantém apenas 2 bits do zoom
-    lsl     r3, r0, #2         ; Desloca zoom para bits [3:2]
-    orr     r2, r2, r3         ; Combina: r2 = opcode | (zoom << 2)
-```
-
-**Formato da instrução:**
-```
-Bits:  [31..4] [3:2] [1:0]
-       Reserv  Zoom  Opcode
-```
-
-**Exemplo (zoom = 2x):**
-```
-r0 = 1 (zoom 2x)
-r2 = 0b10 (opcode NHI)
-r3 = 1 << 2 = 0b0100
-Resultado: r2 = 0b0110 = 0x06
-```
-
-| Zoom | Valor | Deslocado | Final |
-|------|-------|-----------|-------|
-| 1x   | 0     | 0b0000    | 0x02  |
-| 2x   | 1     | 0b0100    | 0x06  |
-| 4x   | 2     | 0b1000    | 0x0A  |
-
----
-
-###### PARTE 3: Envio para FPGA
-
-```assembly
-enviar_instrucao_NHI:
-    str     r2, [r4, #PIO_INSTRUCT]  ; Escreve no registrador
-    dmb     sy                        ; Barreira de memória
-```
-
-**Fluxo:**
-```
-CPU ARM → MMU (traduz endereço) → AXI Bus → 
-Lightweight Bridge → Avalon Bus → PIO_INSTRUCT
-```
-
-**Por que DMB?**
-
-Sem `dmb`, o processador pode reordenar instruções por otimização. A barreira garante que a escrita seja concluída antes de prosseguir.
-
-```
-Sem DMB:  STR instrução → STR start (podem executar fora de ordem)
-Com DMB:  STR instrução → DMB → STR start (ordem garantida)
-```
-
----
-
-###### PARTE 4: Pulso de START
-
-```assembly
-pulso_start_NHI:
-    mov     r2, #1
-    str     r2, [r4, #PIO_START]   ; START = 1
-    dmb     sy
-    
-    mov     r2, #0
-    str     r2, [r4, #PIO_START]   ; START = 0
-    dmb     sy
-```
-
-**Por que dois envios?**
-
-A FPGA detecta uma **transição de borda** (1→0):
-
-```
-        |‾‾‾‾‾|
-START:  |_____|_____  (borda descendente)
-        
-FPGA detecta a transição e inicia processamento
-```
-
----
-
-###### PARTE 5: Polling com Timeout
-
-```assembly
-polling_done_NHI:
-    ldr     r5, =TIMEOUT_VAL       ; r5 = 3.000.000
-    ldr     r5, [r5]
-    
-.LOOP_LE_DONE_NHI:
-    ldr     r2, [r4, #PIO_DONE]    ; Lê flag DONE
-    tst     r2, #1                  ; Testa bit 0
-    bne     .L_SUCCESS_NHI          ; Se DONE=1 → sucesso
-    
-    subs    r5, r5, #1              ; Decrementa contador
-    bne     .LOOP_LE_DONE_NHI       ; Continua se r5 ≠ 0
-    
-    mov     r0, #-2                 ; Timeout: retorna -2
-    b       .EXIT_NHI
-```
-
-**Lógica:**
-1. Inicializa contador com 3 milhões;
-2. Loop: lê PIO_DONE, verifica bit 0;
-3. Se DONE=1: sucesso, sai do loop;
-4. Se DONE=0: decrementa contador e continua;
-5. Se contador chega a 0: timeout (erro -2).
-
-**Tempo aproximado:** 3M iterações × 5 ciclos / 800 MHz ≈ 18,75 ms.
-
----
-
-###### PARTE 6: Retorno
-
-```assembly
-.L_SUCCESS_NHI:
-    mov     r0, #0                  ; Retorna 0 (sucesso)
-    
-.EXIT_NHI:
-    pop     {r4-r6, pc}             ; Restaura contexto e retorna
-```
-
-**O que faz `pop {r4-r6, pc}`:**
-- Restaura r4, r5, r6 dos valores salvos;
-- Carrega endereço de retorno em PC (retorna automaticamente);
-- Equivalente a: restaurar registradores + `bx lr`.
-
----
-
-##### 🔀 Diferenças Entre os Algoritmos
-
-Todos seguem a mesma estrutura, mudando apenas o **opcode**:
-
-```assembly
-# NHI
-mov r2, #OPCODE_NHI          ; r2 = 0b10 = 2
-
-# Replicação
-mov r2, #OPCODE_REPLICACAO   ; r2 = 0b00 = 0
-
-# Decimação
-mov r2, #OPCODE_DECIMACAO    ; r2 = 0b01 = 1
-
-# Média
-mov r2, #OPCODE_MEDIA        ; r2 = 0b11 = 3
-```
-
-**Tabela de instruções (zoom = 2x):**
-
-| Algoritmo    | Opcode | Instrução | Hex  |
-|--------------|--------|-----------|------|
-| Replicação   | 0b00   | 0b0100    | 0x04 |
-| Decimação    | 0b01   | 0b0101    | 0x05 |
-| NHI          | 0b10   | 0b0110    | 0x06 |
-| Média Blocos | 0b11   | 0b0111    | 0x07 |
-
----
-
-##### 🎓 Conceitos-Chave
-
-###### Convenção AAPCS (ARM ABI)
-
-**Registradores:**
-- `r0-r3`: Argumentos e retorno (não precisam ser salvos);
-- `r4-r11`: Devem ser preservados (por isso o push/pop);
-- `lr`: Link Register (endereço de retorno);
-- `pc`: Program Counter (endereço atual).
-
-###### Memory Barriers
-
-**DMB (Data Memory Barrier):** Força a conclusão de operações de memória antes de prosseguir.
-
-Essencial para garantir que:
-1. Instrução seja escrita antes do pulso START;
-2. Hardware veja as operações na ordem correta.
-
-###### Detecção de Borda
-
-A FPGA usa detector de borda descendente:
-```verilog
-if (start_prev == 1 && start == 0)  // Detecta 1→0
-    iniciar_processamento();
-```
-
-Por isso são necessários dois envios (1, depois 0).
-
----
-
-##### 📊 Fluxo Completo
-
-```
-C: result = NHI(1)
-    ↓
-Assembly: MOV r0, #1; BL NHI
-    ↓
-NHI(): Empacota 0x06 → Envia → START → Polling
-    ↓
-FPGA: Detecta instrução → Processa → DONE=1
-    ↓
-Assembly: Retorna r0=0
-    ↓
-C: if (result == 0) printf("Sucesso!")
-```
-
----
-
-#### 8️⃣ `Flag_Done()` - Verificação de Status
-
-**Propósito:** Ler estado do registrador `PIO_DONE`.
-
-**Retorno:**
-- `1`: Hardware pronto;
-- `0`: Hardware ocupado.
-
-**Uso Típico:**
-```c
-// Verificar antes de operação
-if (Flag_Done() == 0) {
-    printf("Hardware ocupado!\n");
-    return -1;
-}
-
-// Executar operação
-NHI(zoom);
-```
-
----
-
-## Ponte Assembly-C: ABI e Convenções
-
-### Application Binary Interface (AAPCS)
-
-**Registradores:**
-```
-r0-r3:  Argumentos de função (r0 = retorno);
-r4-r11: Callee-saved (devem ser preservados);
-r12:    Scratch register;
-r13:    Stack pointer (SP);
-r14:    Link register (LR - endereço de retorno);
-r15:    Program counter (PC).
-```
-
-**Convenção de Chamada:**
-```c
-// Em C
-int result = NHI(2);
-
-// Traduz para Assembly
-MOV r0, #2      @ Argumento em r0
-BL  NHI         @ Branch with Link
-                @ r0 contém resultado
-```
-
-**Stack Frame:**
-```assembly
-function:
-    PUSH {r4-r7, lr}    @ Salva contexto
-    @ ... código ...
-    MOV  r0, #0         @ Prepara retorno
-    POP  {r4-r7, pc}    @ Restaura e retorna
-```
-
----
-
-### Syscalls Linux ARM
-
-**Mecanismo:**
-```assembly
-MOV r7, #<número_syscall>
-SVC 0                      @ Software interrupt
-@ Retorno em r0 (0 = sucesso, -1 = erro)
-```
-
-**Tabela de Syscalls Utilizadas:**
-
-| Número | Nome | Descrição | Parâmetros |
-|--------|------|-----------|------------|
-| 5 | `open` | Abre arquivo | r0=path, r1=flags, r2=mode |
-| 6 | `close` | Fecha arquivo | r0=fd |
-| 91 | `munmap` | Desmapeia memória | r0=addr, r1=length |
-| 192 | `mmap2` | Mapeia memória | r0=addr, r1=len, r2=prot, r3=flags, r4=fd, r5=offset |
-
-**Flags Importantes:**
-```c
-O_RDWR   = 0x0002  // Leitura e escrita
-O_SYNC   = 0x1000  // Sincronização forçada
-O_RDWR | O_SYNC = 0x1002 = 4098 (decimal)
-
-PROT_READ  = 0x1
-PROT_WRITE = 0x2
-PROT_READ | PROT_WRITE = 0x3
-
-MAP_SHARED = 0x1
-```
-
----
-
-### Memory Barriers
-
-**Por que são necessários?**
-
-Sem barreiras, o hardware FPGA pode ver operações **fora de ordem**.
-
-**Tipos:**
-```assembly
-DMB SY   @ Data Memory Barrier - System
-         @ Garante que todas as operações de memória
-         @ antes desta instrução sejam concluídas
-         @ antes das operações seguintes
-
-DSB SY   @ Data Synchronization Barrier
-         @ Mais forte: espera conclusão completa
-
-ISB      @ Instruction Synchronization Barrier
-         @ Para flush de pipeline
-```
-
-**Uso Correto:**
-```assembly
-@ ERRADO: Write sem sincronização
-STR r2, [r4, #PIO_INSTRUCT]
-STR r3, [r4, #PIO_START]
-@ FPGA pode ver em ordem inversa!
-
-@ CORRETO: Com memory barrier
-STR r2, [r4, #PIO_INSTRUCT]
-DMB SY                      @ Força conclusão
-STR r3, [r4, #PIO_START]
-DMB SY
-```
+Escreve no registrador `PIO_COORDS_MOUSE` (offset `0x70`) com sincronização garantida.
 
 ---
 
